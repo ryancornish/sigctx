@@ -1,0 +1,11 @@
+SIGCTX_1.0 {
+  global:
+    sigctx_create;
+    sigctx_copy;
+    sigctx_resume;
+    sigctx_fpstate_size;
+    sigctx_rebind;
+    sigctx_intercept_install;
+  local:
+    *;
+};

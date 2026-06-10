@@ -1,0 +1,4 @@
+usr/include/sigctx/*.h
+usr/lib/*/libsigctx.so
+usr/lib/*/pkgconfig/sigctx.pc
+usr/lib/*/cmake/sigctx/*.cmake

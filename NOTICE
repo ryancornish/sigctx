@@ -1,0 +1,13 @@
+sigctx
+Copyright (C) 2026 Ryan Cornish
+
+This project is licensed under the GNU Lesser General Public License, version 2.1
+or later (LGPL-2.1-or-later), with a single exception.
+
+The file include/sigctx/sigctx_abi_x86_64.h is licensed GPL-2.0 WITH
+Linux-syscall-note, because it transcribes struct layouts from the Linux kernel
+UAPI headers. The Linux-syscall-note exception is what permits userspace to use
+those layouts, so it places no obligation on code that merely uses this library.
+
+Per-file SPDX-License-Identifier tags are authoritative. The full licence texts are
+in COPYING (GPL-2.0) and COPYING.LESSER (LGPL-2.1).

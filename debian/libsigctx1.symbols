@@ -1,0 +1,8 @@
+libsigctx.so.1 libsigctx1 #MINVER#
+ SIGCTX_1.0@SIGCTX_1.0 1.0.0
+ sigctx_copy@SIGCTX_1.0 1.0.0
+ sigctx_create@SIGCTX_1.0 1.0.0
+ sigctx_fpstate_size@SIGCTX_1.0 1.0.0
+ sigctx_intercept_install@SIGCTX_1.0 1.0.0
+ sigctx_rebind@SIGCTX_1.0 1.0.0
+ sigctx_resume@SIGCTX_1.0 1.0.0

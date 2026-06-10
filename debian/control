@@ -1,0 +1,34 @@
+Source: sigctx
+Priority: optional
+Maintainer: Ryan Cornish <100020750+ryancornish@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), cmake
+Standards-Version: 4.7.0
+Section: libs
+Homepage: https://github.com/ryancornish/sigctx
+Rules-Requires-Root: no
+
+Package: libsigctx1
+Architecture: amd64
+Multi-Arch: same
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: resume rt_sigreturn-compatible CPU contexts (runtime library)
+ sigctx builds signal-frame-shaped CPU contexts that the Linux kernel accepts
+ on the rt_sigreturn syscall. That is the primitive underneath cooperative or
+ preemptive userspace thread switching on x86-64, used by runtimes and green
+ thread schedulers.
+ .
+ This package contains the shared library.
+
+Package: libsigctx-dev
+Section: libdevel
+Architecture: amd64
+Multi-Arch: same
+Depends: libsigctx1 (= ${binary:Version}), ${misc:Depends}
+Description: resume rt_sigreturn-compatible CPU contexts (development files)
+ sigctx builds signal-frame-shaped CPU contexts that the Linux kernel accepts
+ on the rt_sigreturn syscall. That is the primitive underneath cooperative or
+ preemptive userspace thread switching on x86-64, used by runtimes and green
+ thread schedulers.
+ .
+ This package contains the headers, the development symlink, the pkg-config
+ file, and the CMake package configuration.
