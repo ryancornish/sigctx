@@ -75,11 +75,12 @@ int main(void)
                  thread_a_entry, (void*)51);
 
    sigctx_intercept_cfg cfg = {
-      .signo      = SIGUSR1,
-      .handler_sp = handler_stack,
-      .handler_ss = sizeof handler_stack,
-      .handler    = handler,
-      .arg        = NULL,
+      .signo       = SIGUSR1,
+      .handler_sp  = handler_stack,
+      .handler_ss  = sizeof handler_stack,
+      .handler     = handler,
+      .arg         = NULL,
+      .block_extra = NULL,
    };
    int rc = sigctx_intercept_install(&cfg);
    if (rc != 0) {

@@ -20,6 +20,15 @@
  * The handler runs as ordinary code on its own stack with the trigger signal masked, so
  * it is free of async-signal-safety constraints and cannot be re-entered.
  *
+ * A second asynchronous signal can still nest into an interception unless the caller
+ * blocks it. block_extra is the knob for that: any signals in it are held blocked for
+ * the whole interception, capture and handler alike, in addition to the trigger. That
+ * is what a caller with an independent timer or IPI signal needs so the timer ISR
+ * cannot land on the shared handler stack mid-capture or re-enter the scheduler while
+ * the handler is choosing and relocating contexts. Resolved by value at install time,
+ * so the pointed-to set need only stay valid for the duration of the
+ * sigctx_intercept_install call.
+ *
  * Per-OS-thread: sigaltstack is per-OS-thread, so call sigctx_intercept_install once on
  * each OS thread that should be interceptible. The sigaction itself is process-wide.
  * Requires gcc or clang with GNU C extensions (the -std=gnu11 through -std=gnu23
@@ -30,6 +39,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <signal.h>
 
 #include <sigctx/sigctx.h>
 
@@ -51,6 +61,7 @@ typedef struct
    size_t            handler_ss;  /* its size, see SIGCTX_INTERCEPT_MIN_FRAME below */
    sigctx_handler_fn handler;     /* picks the context to resume */
    void*             arg;         /* opaque, passed through to handler */
+   sigset_t const*   block_extra; /* optional extra signals to hold blocked for the duration of an interception. NULL for none. */
 } sigctx_intercept_cfg;
 
 /*

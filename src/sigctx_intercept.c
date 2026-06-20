@@ -18,10 +18,27 @@
 _Thread_local static sigctx_intercept_cfg g_cfg;
 _Thread_local static size_t g_fp_cap; /* bytes to reserve for a captured FP area */
 
+/* Resolved copy of cfg.block_extra, empty if the caller passed none. Held by value so
+ * the handler can consult it at delivery time without the caller's set having to
+ * outlive install. */
+_Thread_local static sigset_t g_block_extra;
+
 /* The kernel delivers the handler on this altstack and lays its (possibly large,
  * AVX-sized) signal frame here. Library-owned and generously bounded. Install
  * asserts it covers the runtime _SC_SIGSTKSZ. */
 _Alignas(64) _Thread_local static uint8_t g_altstack[64 * 1024];
+
+/* OR the signals set in src into dst. Hand-rolled rather than sigorset so the library
+ * needs no _GNU_SOURCE, and built only from the async-signal-safe sig* primitives so
+ * it is safe to call from interceptor_on_signal. */
+static void sigctx_mask_or(sigset_t* dst, sigset_t const* src)
+{
+   for (int s = 1; s < _NSIG; ++s) {
+      if (sigismember(src, s) == 1) {
+         sigaddset(dst, s);
+      }
+   }
+}
 
 __attribute__((noreturn))
 static void interceptor_trampoline(sigctx_ucontext_t* paused_ctx)
@@ -59,6 +76,13 @@ static void interceptor_on_signal(int sig, siginfo_t* info, void* opaque)
     * re-interrupted while the user-handler runs on the shared handler stack. */
    sigdelset(&stored->uc_sigmask, g_cfg.signo);
    sigaddset(&kctx->uc_sigmask, g_cfg.signo);
+
+   /* Hold the caller's extra signals blocked through the handler phase too. sa_mask
+    * only covered this capture, so without this they would re-open the moment the
+    * kernel sigreturns into the trampoline, which is the window where the handler
+    * relocates contexts and walks scheduler state. The paused context is left as
+    * captured: what it resumes under is its own concern, not the interception's. */
+   sigctx_mask_or(&kctx->uc_sigmask, &g_block_extra);
 
    /* Interceptor trampoline needs RSP == 8 (mod 16). We arrive via a jump, not a call. */
    sp = (sp & ~(uintptr_t)0xF) - 8;
@@ -103,6 +127,15 @@ int sigctx_intercept_install(sigctx_intercept_cfg const* cfg)
    g_fp_cap = xsave;
    g_cfg = *cfg;
 
+   /* Resolve the extra block set to a by-value copy the handler can read at delivery
+    * time. NULL means none, which leaves an empty set and reproduces the prior
+    * behaviour exactly. */
+   if (cfg->block_extra != NULL) {
+      g_block_extra = *cfg->block_extra;
+   } else {
+      sigemptyset(&g_block_extra);
+   }
+
    stack_t ss;
    ss.ss_sp    = g_altstack;
    ss.ss_size  = sizeof(g_altstack);
@@ -115,6 +148,7 @@ int sigctx_intercept_install(sigctx_intercept_cfg const* cfg)
    memset(&sa, 0, sizeof sa);
    sa.sa_sigaction = interceptor_on_signal;
    sigemptyset(&sa.sa_mask);
+   sigctx_mask_or(&sa.sa_mask, &g_block_extra); /* block the extras during capture */
    sa.sa_flags = SA_ONSTACK | SA_RESTART | SA_SIGINFO;
    if (sigaction(cfg->signo, &sa, NULL) == -1) {
       return -errno;

@@ -260,11 +260,12 @@ static bool run_vector_survival()
       return true;
    }
    sigctx_intercept_cfg cfg{
-      .signo      = SIGUSR1,
-      .handler_sp = survival_stack,
-      .handler_ss = sizeof survival_stack,
-      .handler    = survival_handler,
-      .arg        = nullptr,
+      .signo       = SIGUSR1,
+      .handler_sp  = survival_stack,
+      .handler_ss  = sizeof survival_stack,
+      .handler     = survival_handler,
+      .arg         = nullptr,
+      .block_extra = nullptr,
    };
    if (sigctx_intercept_install(&cfg) != 0) { ++g_fails; std::printf("FAIL install\n"); return false; }
 
@@ -287,6 +288,58 @@ static bool run_vector_survival()
    return true;
 }
 
+/* --- block_extra: hold a second signal masked across the whole interception --- */
+/* The trigger signal is masked through both phases of an interception already. This
+ * checks that block_extra extends that guarantee to an additional signal, in the
+ * handler phase (the trampoline, where a scheduler does its real work), and that the
+ * extra signal is NOT carried into the resumed context, whose mask is its own. */
+alignas(64) static std::uint8_t block_extra_stack[128 * 1024];
+static int g_extra_blocked_in_handler = -1;
+
+static sigctx_ucontext_t* block_extra_handler(sigctx_ucontext_t* paused, void*)
+{
+   sigset_t m;
+   pthread_sigmask(SIG_BLOCK, nullptr, &m);              // the trampoline runs as ordinary code
+   g_extra_blocked_in_handler = sigismember(&m, SIGUSR2);
+   return paused;
+}
+
+static void run_block_extra()
+{
+   sigset_t want_unblocked;
+   sigemptyset(&want_unblocked);
+   sigaddset(&want_unblocked, SIGUSR2);
+   pthread_sigmask(SIG_UNBLOCK, &want_unblocked, nullptr); // start with SIGUSR2 open
+
+   sigctx_intercept_cfg cfg{};
+   cfg.signo = SIGUSR1;
+   cfg.handler_sp = block_extra_stack;
+   cfg.handler_ss = sizeof block_extra_stack;
+   cfg.handler = block_extra_handler;
+
+   // With block_extra set, SIGUSR2 is held blocked through the handler phase.
+   sigset_t extra;
+   sigemptyset(&extra);
+   sigaddset(&extra, SIGUSR2);
+   cfg.block_extra = &extra;
+   g_extra_blocked_in_handler = -1;
+   if (sigctx_intercept_install(&cfg) != 0) { ++g_fails; std::printf("FAIL be install\n"); return; }
+   raise(SIGUSR1);
+
+   sigset_t after;
+   pthread_sigmask(SIG_BLOCK, nullptr, &after);
+   CHECK(g_extra_blocked_in_handler == 1);              // extra masked during the handler
+   CHECK(sigismember(&after, SIGUSR2) == 0);            // and not leaked into the resumed context
+
+   // Control: with block_extra left NULL, the same signal stays open in the handler,
+   // proving the masking is the field's effect and the default path is unchanged.
+   cfg.block_extra = nullptr;
+   g_extra_blocked_in_handler = -1;
+   if (sigctx_intercept_install(&cfg) != 0) { ++g_fails; std::printf("FAIL be install (control)\n"); return; }
+   raise(SIGUSR1);
+   CHECK(g_extra_blocked_in_handler == 0);              // default behaviour unchanged
+}
+
 int main()
 {
    test_create_basic();
@@ -298,6 +351,7 @@ int main()
    test_dyn_copy_faithful();
    test_dyn_holds_full_extended();
    run_vector_survival();
+   run_block_extra();
 
    std::printf("\n%d checks, %d failures\n", g_checks, g_fails);
    return g_fails ? 1 : 0;

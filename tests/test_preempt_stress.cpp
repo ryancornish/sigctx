@@ -119,11 +119,12 @@ static void* worker_main(void* arg)
    worker_result* result = static_cast<worker_result*>(arg);
 
    sigctx_intercept_cfg cfg{};
-   cfg.signo      = kSignal;
-   cfg.handler_sp = g_handler_stack;
-   cfg.handler_ss = g_handler_stack_size;
-   cfg.handler    = preempt_handler;
-   cfg.arg        = nullptr;
+   cfg.signo       = kSignal;
+   cfg.handler_sp  = g_handler_stack;
+   cfg.handler_ss  = g_handler_stack_size;
+   cfg.handler     = preempt_handler;
+   cfg.arg         = nullptr;
+   cfg.block_extra = nullptr;
 
    int rc = sigctx_intercept_install(&cfg);
    g_install_rc.store(rc, std::memory_order_release);
