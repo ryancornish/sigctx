@@ -77,11 +77,9 @@ static void interceptor_on_signal(int sig, siginfo_t* info, void* opaque)
    sigdelset(&stored->uc_sigmask, g_cfg.signo);
    sigaddset(&kctx->uc_sigmask, g_cfg.signo);
 
-   /* Hold the caller's extra signals blocked through the handler phase too. sa_mask
-    * only covered this capture, so without this they would re-open the moment the
-    * kernel sigreturns into the trampoline, which is the window where the handler
-    * relocates contexts and walks scheduler state. The paused context is left as
-    * captured: what it resumes under is its own concern, not the interception's. */
+   /* Hold the extra signals blocked through the handler phase too. sa_mask covered
+    * only the capture, so without this they would re-open the moment the kernel
+    * sigreturns into the trampoline, which is where the handler does its real work. */
    sigctx_mask_or(&kctx->uc_sigmask, &g_block_extra);
 
    /* Interceptor trampoline needs RSP == 8 (mod 16). We arrive via a jump, not a call. */

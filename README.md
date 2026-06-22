@@ -144,10 +144,15 @@ signal arrived. It snapshots that context with `sigctx_copy` and returns the con
 to resume. The interceptor then resumes it with `sigctx_resume`. See
 `examples/preempt_demo.c` for a complete round trip between a worker and main.
 
+The trigger signal is held blocked for the whole interception. The optional
+`block_extra` field in the config holds an additional set of signals blocked over the
+same window, which a caller with a separate timer or IPI signal needs so those cannot
+nest into the capture or the handler. See the header for the details.
+
 ### Preconditions and return values
 
 Misuse of the API, meaning null pointers or a misaligned or undersized FP buffer, is a
-caller bug. So it is checked with `assert()` rather
+caller bug rather than a runtime condition, so it is checked with `assert()` rather
 than a return code. As a result `sigctx_create` returns nothing. `sigctx_copy` returns
 a `sigctx_status`, which is `SIGCTX_OK`, or `SIGCTX_TRUNCATED_TO_LEGACY` when the
 destination FP buffer cannot hold captured extended state and the frame is demoted to
