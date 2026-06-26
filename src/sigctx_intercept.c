@@ -56,6 +56,8 @@ static void interceptor_on_signal(int sig, siginfo_t* info, void* opaque)
    (void)sig;
    (void)info;
 
+   if (g_cfg.handler == NULL) return; // Ignore if threads config incomplete
+
    sigctx_ucontext_t* kctx = (sigctx_ucontext_t*)opaque;
 
    /* Carve a private workspace from the top of the handler stack. */
