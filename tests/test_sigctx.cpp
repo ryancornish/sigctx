@@ -17,10 +17,10 @@
 #include <signal.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <sys/wait.h>          // waitpid: used by the black-box create-run test (all builds)
 
 #ifndef NDEBUG
-#include <sys/resource.h>
-#include <sys/wait.h>
+#include <sys/resource.h>      // setrlimit: death tests only
 #endif
 
 extern "C" {
@@ -46,9 +46,9 @@ static void test_create_basic()
    sigctx_ucontext_t uc;
    sigctx_create(&uc, fp, sizeof fp, stk, sizeof stk, dummy_entry, (void*)0xABCD);
 
-   CHECK(uc.uc_mcontext.rip == (std::uint64_t)dummy_entry);
-   CHECK(uc.uc_mcontext.rdi == 0xABCD);
-   CHECK((uc.uc_mcontext.rsp & 0xF) == 8);            // entry alignment: RSP == 8 (mod 16)
+   CHECK(uc.uc_mcontext.rdi == (std::uint64_t)dummy_entry); // trampoline will call entry
+   CHECK(uc.uc_mcontext.rsi == 0xABCD);               // with this arg
+   CHECK((uc.uc_mcontext.rsp & 0xF) == 0);            // 16-aligned; the trampoline's call yields 8 (mod 16)
    CHECK(uc.uc_mcontext.cs != 0);                     // live CS captured, not zeroed
    CHECK(((std::uintptr_t)uc.uc_mcontext.fpstate % 64) == 0); // FP buffer aligned
    CHECK(uc.uc_mcontext.fpstate->mxcsr == 0x1f80);    // default SSE control word set
@@ -66,7 +66,7 @@ static void test_copy_faithful()
 
    sigctx_status rc = sigctx_copy(&dst, dst_fp, sizeof dst_fp, &src);
    CHECK(rc == SIGCTX_OK);
-   CHECK(dst.uc_mcontext.rdi == 7);
+   CHECK(dst.uc_mcontext.rsi == 7);                              // arg (now in rsi) carried by the copy
    CHECK((void*)dst.uc_mcontext.fpstate == (void*)dst_fp);       // repointed to dst's buffer
    CHECK(dst.uc_mcontext.fpstate->mxcsr == 0x1f80);             // FP bytes carried over
 }
@@ -168,8 +168,8 @@ static void test_dyn_create()
    if (!d.fpstate) return;
 
    sigctx_create(&d.uc, d.fpstate, d.fpstate_size, stk, sizeof stk, dummy_entry, (void*)0x1234);
-   CHECK(d.uc.uc_mcontext.rip == (std::uint64_t)dummy_entry);
-   CHECK(d.uc.uc_mcontext.rdi == 0x1234);
+   CHECK(d.uc.uc_mcontext.rdi == (std::uint64_t)dummy_entry); // trampoline will call entry
+   CHECK(d.uc.uc_mcontext.rsi == 0x1234);                     // with this arg
    CHECK((void*)d.uc.uc_mcontext.fpstate == (void*)d.fpstate);   // points at the heap buffer
    CHECK(((std::uintptr_t)d.uc.uc_mcontext.fpstate % 64) == 0);  // and it is aligned
 
@@ -193,7 +193,7 @@ static void test_dyn_copy_faithful()
 
    sigctx_status rc = sigctx_copy(&dst.uc, dst.fpstate, dst.fpstate_size, &src.uc);
    CHECK(rc == SIGCTX_OK);
-   CHECK(dst.uc.uc_mcontext.rdi == 9);
+   CHECK(dst.uc.uc_mcontext.rsi == 9);                          // arg (now in rsi) carried by the copy
    CHECK((void*)dst.uc.uc_mcontext.fpstate == (void*)dst.fpstate); // repointed to dst's heap buffer
    CHECK(dst.uc.uc_mcontext.fpstate->mxcsr == 0x1f80);            // FP bytes carried over
 
@@ -340,9 +340,36 @@ static void run_block_extra()
    CHECK(g_extra_blocked_in_handler == 0);              // default behaviour unchanged
 }
 
+/* Black-box: a created context, when resumed, actually runs its entry with the given
+ * arg. It runs in a child so the entry can end the run with _exit rather than needing a
+ * return path, and the parent reads the outcome from the exit status. This is the
+ * functional coverage that does not depend on the register-layout details the entry
+ * trampoline (sigctx_context_start) owns. */
+static void bb_entry(void* a)
+{
+   _exit((unsigned long)(std::uintptr_t)a == 0xBEEFu ? 42 : 7);
+}
+
+static void test_create_runs_entry()
+{
+   pid_t pid = fork();
+   if (pid == 0) {
+      alignas(64) static std::uint8_t fp[SIGCTX_FPSTATE_CAPACITY];
+      static std::uint8_t stk[64 * 1024];
+      sigctx_ucontext_t c;
+      sigctx_create(&c, fp, sizeof fp, stk, sizeof stk, bb_entry, (void*)0xBEEFu);
+      sigctx_resume(&c);
+      _exit(9); /* unreachable if resume works */
+   }
+   int st = 0;
+   waitpid(pid, &st, 0);
+   CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 42);       // entry ran with the right arg
+}
+
 int main()
 {
    test_create_basic();
+   test_create_runs_entry();
    test_copy_faithful();
    test_copy_demote();
    test_fpstate_size();

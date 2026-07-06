@@ -14,9 +14,19 @@
 
 #define MIN_USER_STACK_SIZE 128
 
-static __attribute__((noreturn)) void sigctx_entry_returned(void)
+/* Context launcher. Appears as the bottom-most stack frame
+ * for a synthesised sigctx context */
+__attribute__((naked, noreturn))
+static void sigctx_context_start(void)
 {
-   __builtin_trap();
+   __asm__ volatile(
+      ".cfi_undefined %%rip\n\t" /* DWARF unwinders (GDB) stop backtrace here */
+      "xor %%ebp, %%ebp\n\t"
+      "mov %%rdi, %%rax\n\t"     /* entry parameter */
+      "mov %%rsi, %%rdi\n\t"     /* arg parameter */
+      "call *%%rax\n\t"          /* Invoke entry(arg) */
+      "ud2\n\t"                  /* Trap if entry ever returns */
+      ::: "memory");
 }
 
 static __attribute__((unused)) int sigctx_is_aligned(void const* p, size_t align)
@@ -39,16 +49,14 @@ void sigctx_create(sigctx_ucontext_t* out,
 
    memset(out, 0, sizeof *out);
 
-   /* Stack top aligned so entry sees RSP == 8 (mod 16). We arrive via a jump
-    * (sigreturn) with no pushed return address, so we fake the post-call residue:
-    * align DOWN to 16 first, THEN subtract 8. Fallback to a stub return point if entry returns. */
+   /* Stack top 16-aligned. The context-starter is entered by jump and calls entry, so its
+    * call provides the return-address push that leaves entry at RSP == 8 (mod 16). */
    uintptr_t top = ((uintptr_t)stack_base + stack_size) & ~(uintptr_t)0xF;
-   top -= 8;
-   *(uintptr_t*)top = (uintptr_t)sigctx_entry_returned;
 
    out->uc_mcontext.rsp    = top;
-   out->uc_mcontext.rip    = (uint64_t)entry;
-   out->uc_mcontext.rdi    = (uint64_t)entry_arg;
+   out->uc_mcontext.rip    = (uint64_t)sigctx_context_start;
+   out->uc_mcontext.rdi    = (uint64_t)entry;
+   out->uc_mcontext.rsi    = (uint64_t)entry_arg;
    out->uc_mcontext.eflags = 0x202; /* reserved bit1 set, IF set, DF clear */
 
    /* rt_sigreturn reloads CS and SS, where setcontext ignores them. A zeroed CS is
