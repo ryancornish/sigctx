@@ -15,6 +15,13 @@
 #include <sigctx/sigctx.h>
 #include <sigctx/sigctx_intercept.h>
 
+/* The signal-delivery altstack. This demo has a single interceptor that nothing
+ * preempts, so depth 1. A generous fixed bound keeps the example allocation-free.
+ * Install returns -ENOMEM (with a message under -DSIGCTX_DIAGNOSTICS) if it is
+ * ever below one runtime signal frame, and sigctx_altstack_min(depth) is the
+ * portable way to size it exactly. */
+static uint8_t altstack[64 * 1024];
+
 /* Generous fixed handler stack, large enough for the runtime XSAVE area on AVX-512
  * machines too. install returns -ERANGE if it is somehow still too small. */
 static uint8_t handler_stack[32 * 1024];
@@ -76,6 +83,8 @@ int main(void)
 
    sigctx_intercept_cfg cfg = {
       .signo       = SIGUSR1,
+      .altstack_sp = altstack,
+      .altstack_ss = sizeof altstack,
       .handler_sp  = handler_stack,
       .handler_ss  = sizeof handler_stack,
       .handler     = handler,

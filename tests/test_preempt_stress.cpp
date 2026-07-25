@@ -44,6 +44,8 @@ static std::atomic<unsigned> g_preempts{0};
 static std::atomic<int>      g_install_rc{0};
 static pthread_t             g_worker_thread{};
 
+static uint8_t* g_altstack           = nullptr;
+static size_t   g_altstack_size      = 0;
 static uint8_t* g_handler_stack      = nullptr;
 static size_t   g_handler_stack_size = 0;
 
@@ -120,6 +122,8 @@ static void* worker_main(void* arg)
 
    sigctx_intercept_cfg cfg{};
    cfg.signo       = kSignal;
+   cfg.altstack_sp = g_altstack;
+   cfg.altstack_ss = g_altstack_size;
    cfg.handler_sp  = g_handler_stack;
    cfg.handler_ss  = g_handler_stack_size;
    cfg.handler     = preempt_handler;
@@ -181,6 +185,15 @@ int main()
    if (xsave == 0) {
       xsave = sizeof(struct sigctx_fpstate);
    }
+
+   g_altstack_size = round_up_64(sigctx_altstack_min(1));
+   g_altstack = static_cast<uint8_t*>(std::aligned_alloc(SIGCTX_FPSTATE_ALIGN, g_altstack_size));
+   if (!g_altstack) {
+      std::perror("aligned_alloc(altstack)");
+      std::free(g_handler_stack);
+      return 1;
+   }
+
    g_handler_stack_size = static_cast<size_t>(round_up_64(sizeof(sigctx_ucontext_t) + xsave + 64u * 1024u));
    g_handler_stack = static_cast<uint8_t*>(std::aligned_alloc(SIGCTX_FPSTATE_ALIGN, g_handler_stack_size));
    if (!g_handler_stack) {
@@ -194,6 +207,7 @@ int main()
    int rc = pthread_create(&g_worker_thread, nullptr, worker_main, &got);
    if (rc != 0) {
       std::printf("pthread_create(worker) failed: %d\n", rc);
+      std::free(g_altstack);
       std::free(g_handler_stack);
       return 1;
    }
@@ -202,6 +216,7 @@ int main()
       std::printf("pthread_create(kicker) failed: %d\n", rc);
       g_done.store(true, std::memory_order_release);
       pthread_join(g_worker_thread, nullptr);
+      std::free(g_altstack);
       std::free(g_handler_stack);
       return 1;
    }
@@ -210,6 +225,7 @@ int main()
    g_done.store(true, std::memory_order_release);
    pthread_join(kicker, nullptr);
 
+   std::free(g_altstack);
    std::free(g_handler_stack);
 
    int install_rc = g_install_rc.load(std::memory_order_acquire);

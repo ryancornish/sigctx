@@ -133,8 +133,14 @@ sigctx_create(&a.uc, a.fpstate, sizeof a.fpstate,
               stack, sizeof stack, entry, arg);
 
 sigctx_intercept_cfg cfg = {
-    .signo = SIGUSR1, .handler_sp = handler_stack, .handler_ss = sizeof handler_stack,
-    .handler = pick_next, .arg = sched,
+    .signo = SIGUSR1,
+    .altstack_sp = signal_stack,
+    .altstack_ss = sizeof signal_stack,
+    .handler_sp = handler_stack,
+    .handler_ss = sizeof handler_stack,
+    .handler = pick_next,
+    .arg = sched,
+    .block_extra = NULL,
 };
 sigctx_intercept_install(&cfg);          /* returns 0 or a negative errno */
 ```

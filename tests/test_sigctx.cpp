@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 
 #include <pthread.h>
 #include <signal.h>
@@ -135,6 +136,20 @@ static void test_precondition_aborts()
       sigctx_create(&src, src_fp, sizeof src_fp, stk, sizeof stk, dummy_entry, nullptr);
       sigctx_copy(&dst, dst_tiny, sizeof dst_tiny, &src);
    }));
+
+   // install with a null altstack is a caller-contract violation and must abort,
+   // distinct from an undersized altstack, which is a runtime -ENOMEM return.
+   CHECK(aborts([&] {
+      alignas(64) static std::uint8_t hs[128 * 1024];
+      sigctx_intercept_cfg cfg{};
+      cfg.signo = SIGUSR1;
+      cfg.altstack_sp = nullptr;      // the violation
+      cfg.altstack_ss = 256 * 1024;
+      cfg.handler_sp = hs;
+      cfg.handler_ss = sizeof hs;
+      cfg.handler = [](sigctx_ucontext_t* p, void*) { return p; };
+      (void)sigctx_intercept_install(&cfg);
+   }));
 }
 #else
 static void test_precondition_aborts()
@@ -243,6 +258,7 @@ static void test_dyn_holds_full_extended()
  * capture, clobber, and resume round trip, and the extended XSAVE area the kernel
  * did capture is relocated byte for byte by sigctx_copy. */
 alignas(64) static std::uint8_t survival_stack[32 * 1024];
+alignas(64) static std::uint8_t survival_altstack[128 * 1024];
 
 static sigctx_ucontext_t* survival_handler(sigctx_ucontext_t* paused, void*)
 {
@@ -261,6 +277,8 @@ static bool run_vector_survival()
    }
    sigctx_intercept_cfg cfg{
       .signo       = SIGUSR1,
+      .altstack_sp = survival_altstack,
+      .altstack_ss = sizeof survival_altstack,
       .handler_sp  = survival_stack,
       .handler_ss  = sizeof survival_stack,
       .handler     = survival_handler,
@@ -294,6 +312,7 @@ static bool run_vector_survival()
  * handler phase (the trampoline, where a scheduler does its real work), and that the
  * extra signal is NOT carried into the resumed context, whose mask is its own. */
 alignas(64) static std::uint8_t block_extra_stack[128 * 1024];
+alignas(64) static std::uint8_t block_extra_altstack[128 * 1024];
 static int g_extra_blocked_in_handler = -1;
 
 static sigctx_ucontext_t* block_extra_handler(sigctx_ucontext_t* paused, void*)
@@ -313,6 +332,8 @@ static void run_block_extra()
 
    sigctx_intercept_cfg cfg{};
    cfg.signo = SIGUSR1;
+   cfg.altstack_sp = block_extra_altstack;
+   cfg.altstack_ss = sizeof block_extra_altstack;
    cfg.handler_sp = block_extra_stack;
    cfg.handler_ss = sizeof block_extra_stack;
    cfg.handler = block_extra_handler;
@@ -366,6 +387,134 @@ static void test_create_runs_entry()
    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 42);       // entry ran with the right arg
 }
 
+/* --- altstack sizing queries ---------------------------------------------- */
+/* The install-time sizing math is now caller-facing via two query functions, so
+ * a caller can size a buffer up front instead of trial-and-error against errno.
+ * These assert the contract the docs promise: a slot covers one runtime frame,
+ * and min(depth) scales it, with depth 0 treated as 1. */
+static void test_altstack_sizing()
+{
+   size_t slot = sigctx_altstack_slot_min();
+   long   want = sysconf(_SC_SIGSTKSZ);
+
+   CHECK(slot > 0);
+   if (want > 0) {
+      CHECK(slot >= (size_t)want);          // covers one runtime signal frame
+   }
+   CHECK(sigctx_altstack_min(1) == slot);   // depth 1 is one slot
+   CHECK(sigctx_altstack_min(4) == 4 * slot); // scales linearly with depth
+   CHECK(sigctx_altstack_min(0) == slot);   // depth 0 clamps to 1, never a zero-size stack
+}
+
+/* --- install rejects undersized stacks with the documented codes ----------- */
+/* Sizing failures are runtime returns (not asserts) because a caller cannot
+ * precompute them. These confirm each code fires for its buffer and that a
+ * correctly sized config still installs, so the checks are guarding the
+ * boundary, not a blanket rejection. */
+alignas(64) static std::uint8_t good_handler_stack[128 * 1024];
+alignas(64) static std::uint8_t good_altstack[256 * 1024];
+
+static sigctx_ucontext_t* noop_handler(sigctx_ucontext_t* paused, void*) { return paused; }
+
+static void test_install_size_rejects()
+{
+   sigctx_intercept_cfg cfg{
+      .signo       = SIGUSR1,
+      .altstack_sp = good_altstack,
+      .altstack_ss = sizeof good_altstack,
+      .handler_sp  = good_handler_stack,
+      .handler_ss  = sizeof good_handler_stack,
+      .handler     = noop_handler,
+      .arg         = nullptr,
+      .block_extra = nullptr,
+   };
+
+   // Undersized altstack -> -ENOMEM.
+   {
+      sigctx_intercept_cfg bad = cfg;
+      bad.altstack_ss = 64; // far below one signal frame
+      CHECK(sigctx_intercept_install(&bad) == -ENOMEM);
+   }
+
+   // Undersized handler stack -> -ERANGE.
+   {
+      sigctx_intercept_cfg bad = cfg;
+      bad.handler_ss = 64;
+      CHECK(sigctx_intercept_install(&bad) == -ERANGE);
+   }
+
+   // Correctly sized -> success. Proves the rejections above are boundary
+   // checks, not a blanket failure of the new field.
+   CHECK(sigctx_intercept_install(&cfg) == 0);
+}
+
+/* --- nesting: a second SA_ONSTACK signal preempts a live handler ----------- */
+/* The property stage 2 depends on and that the resized, caller-owned altstack
+ * exists to serve: while the interceptor's handler runs on the altstack, a
+ * different, higher-priority signal can be delivered, nest its own frame ABOVE
+ * the current one, run to completion, pop, and let the interrupted handler
+ * finish, all on one altstack. The nesting signal is a plain SA_ONSTACK handler
+ * (not a second interceptor), which is exactly the timer/peripheral shape.
+ *
+ * A failure here (altstack too small, or nesting mishandled) manifests as
+ * corruption or a crash inside the nested delivery, so reaching the post-raise
+ * checks with both flags set is the proof. */
+alignas(64) static std::uint8_t nest_handler_stack[128 * 1024];
+alignas(64) static std::uint8_t nest_altstack[256 * 1024];
+static volatile int g_nest_ran       = 0;
+static volatile int g_outer_resumed  = 0;
+static constexpr int kNestSignal     = SIGUSR2;
+
+static void nest_plain_handler(int) // plain SA_ONSTACK handler, nests on the altstack
+{
+   g_nest_ran = 1;
+}
+
+static sigctx_ucontext_t* nest_outer_handler(sigctx_ucontext_t* paused, void*)
+{
+   // We are running on the altstack. Raise the nesting signal at ourselves and
+   // unblock it: it must be delivered NOW, above this frame, run, and return
+   // here so we can resume the captured context.
+   raise(kNestSignal);
+   sigset_t unblock;
+   sigemptyset(&unblock);
+   sigaddset(&unblock, kNestSignal);
+   pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
+   // If nesting works, g_nest_ran is set by the time we get here.
+   g_outer_resumed = 1;
+   return paused;
+}
+
+static void test_altstack_nesting()
+{
+   // Plain nesting handler on the altstack.
+   struct sigaction sa;
+   std::memset(&sa, 0, sizeof sa);
+   sa.sa_handler = nest_plain_handler;
+   sigemptyset(&sa.sa_mask);
+   sa.sa_flags = SA_ONSTACK;
+   if (sigaction(kNestSignal, &sa, nullptr) != 0) { ++g_fails; std::printf("FAIL nest sigaction\n"); return; }
+
+   sigctx_intercept_cfg cfg{
+      .signo       = SIGUSR1,
+      .altstack_sp = nest_altstack,
+      .altstack_ss = sizeof nest_altstack,
+      .handler_sp  = nest_handler_stack,
+      .handler_ss  = sizeof nest_handler_stack,
+      .handler     = nest_outer_handler,
+      .arg         = nullptr,
+      .block_extra = nullptr, // do NOT block the nesting signal: we want it to nest
+   };
+   if (sigctx_intercept_install(&cfg) != 0) { ++g_fails; std::printf("FAIL nest install\n"); return; }
+
+   g_nest_ran = 0;
+   g_outer_resumed = 0;
+   raise(SIGUSR1); // enters nest_outer_handler, which triggers the nested delivery
+
+   CHECK(g_nest_ran == 1);      // the nested handler ran above the interceptor handler
+   CHECK(g_outer_resumed == 1); // and the interceptor handler resumed cleanly afterward
+}
+
 int main()
 {
    test_create_basic();
@@ -379,6 +528,9 @@ int main()
    test_dyn_holds_full_extended();
    run_vector_survival();
    run_block_extra();
+   test_altstack_sizing();
+   test_install_size_rejects();
+   test_altstack_nesting();
 
    std::printf("\n%d checks, %d failures\n", g_checks, g_fails);
    return g_fails ? 1 : 0;

@@ -6,6 +6,8 @@ SIGCTX_1.0 {
     sigctx_fpstate_size;
     sigctx_rebind;
     sigctx_intercept_install;
+    sigctx_altstack_slot_min;
+    sigctx_altstack_min;
   local:
     *;
 };
