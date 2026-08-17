@@ -73,7 +73,15 @@ typedef struct
  *       plain SA_ONSTACK handler) and can preempt one another and this interceptor.
  *       Under SA_ONSTACK the kernel stacks a nested frame directly above the
  *       current one and pops it on sigreturn, so at peak, one frame per
- *       simultaneously-live handler coexists here. The peak equals the number
+ *       simultaneously-live handler coexists here.
+ *
+ *       Note that THIS interceptor occupies a slot only during its capture
+ *       phase, not while your handler callback runs. The capture diverts
+ *       execution onto handler_sp before calling you, and the kernel picks the
+ *       altstack base rather than nesting whenever the interrupted SP is outside
+ *       the altstack. So a signal arriving during your callback starts a fresh
+ *       frame at the base. Count the capture window, not the callback, or you
+ *       will over-size by one level per interceptor. The peak equals the number
  *       of distinct priority levels in your signal mask table, which stays
  *       finite only if that table is an ACYCLIC ordering (level N preemptible
  *       strictly by levels above N). Count the levels, pass that as depth.
