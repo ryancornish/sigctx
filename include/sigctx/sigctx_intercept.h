@@ -26,6 +26,8 @@
  *
  * Per-OS-thread: sigaltstack is per-OS-thread, so call sigctx_intercept_install once on
  * each OS thread that should be interceptible. The sigaction itself is process-wide.
+ * sigctx_intercept_uninstall reverses an install on the calling thread, and must be
+ * called before the caller frees that thread's handler stack or altstack.
  * Requires gcc or clang with GNU C extensions (the -std=gnu11 through -std=gnu23
  * dialects). x86-64 Linux, glibc >= 2.34. Compiles as C or C++.
  */
@@ -140,6 +142,32 @@ size_t sigctx_altstack_min(unsigned depth);
  * actionable message. The caller decides how to handle failure.
  */
 int sigctx_intercept_install(sigctx_intercept_cfg const* cfg);
+
+/*
+ * Reverse sigctx_intercept_install on the calling thread, handing the thread back
+ * as the first install found it:
+ *
+ *   - this thread's interceptor config is cleared, so a delivery here returns at
+ *     once and touches neither the handler stack nor the altstack;
+ *   - the altstack the thread had before its FIRST install is registered again
+ *     (none, if it had none);
+ *   - the signal's disposition is restored to what it was before any thread
+ *     installed for it, but only when the LAST installed thread uninstalls, since
+ *     the disposition is shared by the whole process.
+ *
+ * Call it before freeing the buffers named in the config. Freeing them first
+ * leaves the thread pointing at unmapped memory: any SA_ONSTACK handler run on it
+ * then faults, and so does the next delivery of the intercepted signal.
+ *
+ * Signals already pending are left pending. They are delivered to whatever
+ * disposition is in place once the caller unblocks them.
+ *
+ * Returns 0 on success, and when nothing is installed on this thread. Returns
+ * -EPERM, changing nothing, if called from a handler running on the altstack,
+ * which cannot be replaced underneath itself. Otherwise a negative errno from
+ * sigaltstack or sigaction.
+ */
+int sigctx_intercept_uninstall(void);
 
 #ifdef __cplusplus
 }

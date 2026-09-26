@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(sigctx
-  VERSION 1.0.0
+  VERSION 1.1.0
   DESCRIPTION "Synthesize and resume Linux rt_sigreturn-compatible CPU contexts (x86-64)"
   HOMEPAGE_URL "https://github.com/ryancornish/sigctx"
   LANGUAGES C)
@@ -46,7 +46,7 @@ target_compile_options(sigctx PRIVATE
   $<$<C_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic>)
 
 # Export only the documented public symbols and give them a version tag. This
-# keeps internal helpers out of the shared object and gives Debian a stable,
+# keeps internal helpers out of the shared object and gives consumers a stable,
 # trackable symbol set. Applies to the shared build with a GNU-style linker.
 if(BUILD_SHARED_LIBS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   set(_sigctx_map "${CMAKE_CURRENT_SOURCE_DIR}/sigctx.map")

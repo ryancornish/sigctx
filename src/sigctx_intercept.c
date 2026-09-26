@@ -9,7 +9,9 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
@@ -34,6 +36,29 @@ _Thread_local static size_t g_fp_cap; /* bytes to reserve for a captured FP area
  * the handler can consult it at delivery time without the caller's set having to
  * outlive install. */
 _Thread_local static sigset_t g_block_extra;
+
+/* What install replaced on this thread, so uninstall can hand the thread back as
+ * it found it. The prior altstack is recorded by the FIRST install on a thread
+ * only: a re-install replaces the config in place, and recording then would save
+ * sigctx's own altstack as the one to restore. */
+_Thread_local static bool    g_installed;
+_Thread_local static stack_t g_prior_altstack;
+
+/* The disposition is process-wide, so it belongs to the SET of threads that have
+ * installed for a signal, not to any one of them. Counted per signal: the
+ * disposition in place before the first install is saved, and restored only when
+ * the last installed thread uninstalls. Install and uninstall run in thread
+ * context, never from a handler, so an ordinary mutex is fine. */
+static pthread_mutex_t  g_disposition_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned         g_installed_threads[_NSIG];
+static struct sigaction g_prior_action[_NSIG];
+
+/* One installed thread leaves signo's set. Call with g_disposition_lock held. */
+static int release_disposition_locked(int signo)
+{
+   if (--g_installed_threads[signo] != 0) return 0;
+   return (sigaction(signo, &g_prior_action[signo], NULL) == -1) ? -errno : 0;
+}
 
 /* OR the signals set in src into dst. Hand-rolled rather than sigorset so the library
  * needs no _GNU_SOURCE, and built only from the async-signal-safe sig* primitives so
@@ -157,6 +182,8 @@ int sigctx_intercept_install(sigctx_intercept_cfg const* cfg)
       return -ERANGE;
    }
 
+   int const previous_signo = g_cfg.signo; /* meaningful only on a re-install */
+
    g_fp_cap = xsave;
    g_cfg = *cfg;
 
@@ -169,13 +196,19 @@ int sigctx_intercept_install(sigctx_intercept_cfg const* cfg)
       sigemptyset(&g_block_extra);
    }
 
+   bool const first = !g_installed;
+
    stack_t ss;
    ss.ss_sp    = cfg->altstack_sp;
    ss.ss_size  = cfg->altstack_ss;
    ss.ss_flags = 0;
-   if (sigaltstack(&ss, NULL) == -1) {
-      return -errno;
+   stack_t replaced;
+   if (sigaltstack(&ss, &replaced) == -1) {
+      int const err = -errno;
+      if (first) memset(&g_cfg, 0, sizeof g_cfg);
+      return err;
    }
+   if (first) g_prior_altstack = replaced;
 
    struct sigaction sa;
    memset(&sa, 0, sizeof sa);
@@ -183,8 +216,69 @@ int sigctx_intercept_install(sigctx_intercept_cfg const* cfg)
    sigemptyset(&sa.sa_mask);
    sigctx_mask_or(&sa.sa_mask, &g_block_extra); /* block the extras during capture */
    sa.sa_flags = SA_ONSTACK | SA_RESTART | SA_SIGINFO;
-   if (sigaction(cfg->signo, &sa, NULL) == -1) {
-      return -errno;
+
+   /* Join cfg->signo's installed set, saving the disposition this replaces if no
+    * thread held it yet. A re-install for the same signal only refreshes the
+    * action. A re-install for a DIFFERENT signal leaves the old one's set, which
+    * restores the old signal's prior disposition if this was its last thread. */
+   pthread_mutex_lock(&g_disposition_lock);
+   int rc = 0;
+   if (first || previous_signo != cfg->signo) {
+      struct sigaction* const save = (g_installed_threads[cfg->signo] == 0)
+                                   ? &g_prior_action[cfg->signo] : NULL;
+      if (sigaction(cfg->signo, &sa, save) == -1) {
+         rc = -errno;
+      } else {
+         ++g_installed_threads[cfg->signo];
+         if (!first) rc = release_disposition_locked(previous_signo);
+      }
+   } else if (sigaction(cfg->signo, &sa, NULL) == -1) {
+      rc = -errno;
    }
-   return 0;
+   pthread_mutex_unlock(&g_disposition_lock);
+
+   if (rc != 0 && first) {
+      /* Leave a thread that failed its first install as it was. */
+      (void)sigaltstack(&g_prior_altstack, NULL);
+      memset(&g_cfg, 0, sizeof g_cfg);
+      return rc;
+   }
+   g_installed = true;
+   return rc;
+}
+
+int sigctx_intercept_uninstall(void)
+{
+   if (!g_installed) return 0;
+
+   /* The altstack cannot be replaced from a handler running on it, and doing the
+    * other halves without it would hand the thread back half done. So refuse
+    * before changing anything. */
+   stack_t current;
+   if (sigaltstack(NULL, &current) == -1) return -errno;
+   if (current.ss_flags & SS_ONSTACK) return -EPERM;
+
+   /* The config first. The handler is cleared before the rest, with a signal
+    * fence, because a delivery on this thread reads g_cfg asynchronously and must
+    * see "no handler" rather than a half-cleared config. From here a delivery
+    * returns at once and touches neither of the caller's stacks. */
+   int const signo = g_cfg.signo;
+   g_cfg.handler = NULL;
+   __atomic_signal_fence(__ATOMIC_SEQ_CST);
+   memset(&g_cfg, 0, sizeof g_cfg);
+   g_fp_cap = 0;
+   sigemptyset(&g_block_extra);
+
+   /* Then the altstack. SS_ONSTACK is a query result, never a valid request. */
+   stack_t prior = g_prior_altstack;
+   prior.ss_flags &= ~SS_ONSTACK;
+   int rc = (sigaltstack(&prior, NULL) == -1) ? -errno : 0;
+
+   /* Then the disposition, restored only by the last installed thread. */
+   pthread_mutex_lock(&g_disposition_lock);
+   int const released = release_disposition_locked(signo);
+   pthread_mutex_unlock(&g_disposition_lock);
+
+   g_installed = false;
+   return (rc != 0) ? rc : released;
 }

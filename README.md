@@ -100,10 +100,6 @@ ctest --test-dir build
 ./build/preempt_demo
 ```
 
-A `debian/` directory is included for building `.deb` packages on Debian and Ubuntu
-with `dpkg-buildpackage`, producing a `libsigctx1` runtime package and a
-`libsigctx-dev` package.
-
 ## Using it from another project
 
 After installing, with CMake:

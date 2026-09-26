@@ -15,6 +15,8 @@
 #include <cerrno>
 
 #include <pthread.h>
+#include <atomic>
+#include <thread>
 #include <signal.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -515,6 +517,189 @@ static void test_altstack_nesting()
    CHECK(g_outer_resumed == 1); // and the interceptor handler resumed cleanly afterward
 }
 
+/* --- uninstall: hand the thread back as it was ---------------------------- */
+/* A caller that frees its handler stack or altstack must first stop the thread
+ * from pointing at them. Install leaves three things behind: the thread's
+ * interceptor config (naming the handler stack), the registered altstack, and
+ * the process-wide disposition. These pin that uninstall undoes all three, and
+ * only undoes the process-wide one when the LAST installed thread leaves. */
+alignas(64) static std::uint8_t un_handler_stack[128 * 1024];
+alignas(64) static std::uint8_t un_altstack[256 * 1024];
+alignas(64) static std::uint8_t un_prior_altstack[256 * 1024];
+static volatile int g_prior_handler_ran = 0;
+static volatile int g_interceptor_ran   = 0;
+
+static void prior_handler(int) { g_prior_handler_ran = 1; }
+
+static sigctx_ucontext_t* counting_handler(sigctx_ucontext_t* paused, void*)
+{
+   g_interceptor_ran = 1;
+   return paused;
+}
+
+static sigctx_intercept_cfg uninstall_cfg()
+{
+   sigctx_intercept_cfg cfg{};
+   cfg.signo       = SIGUSR1;
+   cfg.altstack_sp = un_altstack;
+   cfg.altstack_ss = sizeof un_altstack;
+   cfg.handler_sp  = un_handler_stack;
+   cfg.handler_ss  = sizeof un_handler_stack;
+   cfg.handler     = counting_handler;
+   return cfg;
+}
+
+/* Run fn in a child whose verdict is its exit code. A forked child inherits the
+ * forking thread's sigctx state along with its altstack and dispositions, and
+ * earlier tests installed on this thread, so the child first hands all of that
+ * back. Each case then really does start from "nothing installed". */
+template<typename F>
+static bool in_child(F fn)
+{
+   pid_t pid = fork();
+   if (pid == 0) {
+      if (sigctx_intercept_uninstall() != 0) _exit(2);
+      _exit(fn() ? 0 : 1);
+   }
+   int st = 0;
+   waitpid(pid, &st, 0);
+   return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+static void test_uninstall()
+{
+   // Nothing installed on this thread: a no-op that succeeds.
+   CHECK(in_child([] { return sigctx_intercept_uninstall() == 0; }));
+
+   // The altstack the thread had BEFORE install is the one it gets back.
+   CHECK(in_child([] {
+      stack_t prior{};
+      prior.ss_sp   = un_prior_altstack;
+      prior.ss_size = sizeof un_prior_altstack;
+      if (sigaltstack(&prior, nullptr) != 0) return false;
+
+      sigctx_intercept_cfg cfg = uninstall_cfg();
+      if (sigctx_intercept_install(&cfg) != 0) return false;
+      if (sigctx_intercept_install(&cfg) != 0) return false;   // re-install keeps the original
+      if (sigctx_intercept_uninstall() != 0) return false;
+
+      stack_t now{};
+      sigaltstack(nullptr, &now);
+      return now.ss_sp == un_prior_altstack && (now.ss_flags & SS_DISABLE) == 0;
+   }));
+
+   // A thread that had no altstack gets none back, rather than a dangling one.
+   CHECK(in_child([] {
+      sigctx_intercept_cfg cfg = uninstall_cfg();
+      if (sigctx_intercept_install(&cfg) != 0) return false;
+      if (sigctx_intercept_uninstall() != 0) return false;
+      stack_t now{};
+      sigaltstack(nullptr, &now);
+      return (now.ss_flags & SS_DISABLE) != 0;
+   }));
+
+   // The prior disposition is restored, so the signal reaches the application's
+   // own handler again and never the interceptor.
+   CHECK(in_child([] {
+      struct sigaction sa;
+      std::memset(&sa, 0, sizeof sa);
+      sa.sa_handler = prior_handler;
+      sigaction(SIGUSR1, &sa, nullptr);
+
+      sigctx_intercept_cfg cfg = uninstall_cfg();
+      if (sigctx_intercept_install(&cfg) != 0) return false;
+      if (sigctx_intercept_uninstall() != 0) return false;
+
+      g_prior_handler_ran = 0;
+      g_interceptor_ran = 0;
+      raise(SIGUSR1);
+      return g_prior_handler_ran == 1 && g_interceptor_ran == 0;
+   }));
+
+   // Two threads installed: the first to leave must NOT take the disposition
+   // away from the one still intercepting. Only the last restores it.
+   CHECK(in_child([] {
+      struct sigaction sa;
+      std::memset(&sa, 0, sizeof sa);
+      sa.sa_handler = prior_handler;
+      sigaction(SIGUSR1, &sa, nullptr);
+
+      sigctx_intercept_cfg cfg = uninstall_cfg();
+      if (sigctx_intercept_install(&cfg) != 0) return false;
+
+      // A second thread installs and uninstalls on its own stacks.
+      std::thread other([] {
+         alignas(64) static std::uint8_t h[128 * 1024];
+         alignas(64) static std::uint8_t a[256 * 1024];
+         sigctx_intercept_cfg c = uninstall_cfg();
+         c.handler_sp = h; c.handler_ss = sizeof h;
+         c.altstack_sp = a; c.altstack_ss = sizeof a;
+         sigctx_intercept_install(&c);
+         sigctx_intercept_uninstall();
+      });
+      other.join();
+
+      g_interceptor_ran = 0;
+      raise(SIGUSR1);                                    // still intercepted here
+      bool const kept = g_interceptor_ran == 1;
+
+      if (sigctx_intercept_uninstall() != 0) return false;
+      g_prior_handler_ran = 0;
+      raise(SIGUSR1);                                    // and now the prior handler
+      return kept && g_prior_handler_ran == 1;
+   }));
+
+   // A thread that has uninstalled while ANOTHER still holds the disposition
+   // must ignore the signal, not run the interceptor on stacks its caller may
+   // already have freed. That is what clearing the thread's config is for.
+   CHECK(in_child([] {
+      sigctx_intercept_cfg cfg = uninstall_cfg();
+      if (sigctx_intercept_install(&cfg) != 0) return false;
+
+      std::atomic<int> stage{0};
+      std::thread holder([&stage] {
+         alignas(64) static std::uint8_t h[128 * 1024];
+         alignas(64) static std::uint8_t a[256 * 1024];
+         sigctx_intercept_cfg c = uninstall_cfg();
+         c.handler_sp = h; c.handler_ss = sizeof h;
+         c.altstack_sp = a; c.altstack_ss = sizeof a;
+         sigctx_intercept_install(&c);
+         stage.store(1);
+         while (stage.load() != 2) { }                   // hold it while main tests
+         sigctx_intercept_uninstall();
+      });
+      while (stage.load() != 1) { }
+
+      if (sigctx_intercept_uninstall() != 0) return false;
+      g_interceptor_ran = 0;
+      raise(SIGUSR1);                                    // disposition is still sigctx's
+      bool const ignored = g_interceptor_ran == 0;
+
+      stage.store(2);
+      holder.join();
+      return ignored;
+   }));
+
+   // Uninstalling from a handler that is running on the altstack cannot restore
+   // the altstack underneath itself, so it refuses and changes nothing.
+   CHECK(in_child([] {
+      static volatile int rc = 1;
+      struct sigaction sa;
+      std::memset(&sa, 0, sizeof sa);
+      sa.sa_handler = [](int) { rc = sigctx_intercept_uninstall(); };
+      sa.sa_flags = SA_ONSTACK;
+      sigaction(SIGUSR2, &sa, nullptr);
+
+      sigctx_intercept_cfg cfg = uninstall_cfg();
+      if (sigctx_intercept_install(&cfg) != 0) return false;
+      raise(SIGUSR2);                                    // runs on the altstack
+
+      g_interceptor_ran = 0;
+      raise(SIGUSR1);                                    // still installed
+      return rc == -EPERM && g_interceptor_ran == 1;
+   }));
+}
+
 int main()
 {
    test_create_basic();
@@ -531,6 +716,7 @@ int main()
    test_altstack_sizing();
    test_install_size_rejects();
    test_altstack_nesting();
+   test_uninstall();
 
    std::printf("\n%d checks, %d failures\n", g_checks, g_fails);
    return g_fails ? 1 : 0;

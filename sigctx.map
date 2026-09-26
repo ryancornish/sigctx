@@ -11,3 +11,8 @@ SIGCTX_1.0 {
   local:
     *;
 };
+
+SIGCTX_1.1 {
+  global:
+    sigctx_intercept_uninstall;
+} SIGCTX_1.0;
